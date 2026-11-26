@@ -11,3 +11,21 @@ Overall, this experiment is designed to study the subject’s visual and auditor
 
 The purpose of this experiment is to find a way to detect surprise or anticipation by looking at the electrical activity of the brain. The experimenters hope that by creating a system to detect the P300 component, they will be able to solve the problem of detecting these emotions.
 
+
+## Profiling and optimizing the network
+
+`profile_model.py` profiles the notebook's network with `torch.profiler` and
+measures the original training loop and inference against optimized versions
+(`torch.compile`, `torch.inference_mode()`, `loss.item()`,
+`zero_grad(set_to_none=True)`). It checks that the compiled model gives the
+same outputs, writes a Chrome/Perfetto trace, and prints a JSON summary of the
+measured before/after times.
+
+```
+!git clone https://github.com/serjankaur05/ML-for-EEG-Data
+!python ML-for-EEG-Data/profile_model.py
+```
+
+The same network is also the test model for
+[tinyfuse](https://github.com/serjankaur05/tinyfuse), a small C/LLVM/Go
+performance stack that compiles it to fused SIMD kernels.
