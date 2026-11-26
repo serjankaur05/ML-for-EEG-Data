@@ -118,7 +118,9 @@ def time_training(optimized: bool, repeats: int = 5):
         losses = train(model, x, y, ITERATIONS, optimized)
         sync()
         times.append(time.perf_counter() - t)
-    return statistics.median(times), float(losses[-1]), note
+    last = losses[-1]
+    last = last.detach().item() if isinstance(last, torch.Tensor) else last
+    return statistics.median(times), float(last), note
 
 
 def time_inference(model, x, mode: str, repeats: int = 100):
