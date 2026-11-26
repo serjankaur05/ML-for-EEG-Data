@@ -13,12 +13,17 @@ What is compared
     baseline   the notebook's loop: model in eager mode, loss_data.append(loss)
                (keeps each loss tensor and its autograd node chain referenced),
                zero_grad() writes zeros into every gradient
-    optimized  torch.compile(model) (TorchInductor fuses each Linear's bias add
-               and activation), loss_data.append(loss.item()) stores a float,
-               zero_grad(set_to_none=True) skips the zero fill
+    fused_adam same eager model, but Adam(fused=True) on GPU: one kernel updates
+               every parameter instead of a chain of small per-op kernels (the
+               profiler showed Adam at 46% of GPU time on a T4)
+    optimized  fused Adam + torch.compile(model) (TorchInductor fuses each
+               Linear's bias add and activation), loss.item() instead of the
+               tensor, zero_grad(set_to_none=True)
   Inference (batch of 256 samples):
     baseline   model(x) with autograd recording, as in the notebook's test cells
-    optimized  torch.inference_mode(), then also torch.compile
+    optimized  torch.inference_mode(); torch.compile; and on GPU
+               torch.compile(mode="reduce-overhead"), which replays the whole
+               forward pass from one CUDA graph
   If torch.compile is unavailable (no C++ compiler), the optimized runs fall
   back to eager mode and the summary says so.
 """
@@ -75,9 +80,10 @@ def sync():
         torch.cuda.synchronize()
 
 
-def train(model, x, y, iterations, optimized: bool):
+def train(model, x, y, iterations, optimized: bool, fused_adam: bool = False):
     loss_fn = nn.MSELoss()
-    opt = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    fused = fused_adam and DEVICE == "cuda"
+    opt = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, fused=fused)
     loss_data = []
     for _ in range(iterations):
         out = model(x)
@@ -93,7 +99,7 @@ def train(model, x, y, iterations, optimized: bool):
     return loss_data
 
 
-def time_training(optimized: bool, repeats: int = 5):
+def time_training(optimized: bool, repeats: int = 5, fused_adam: bool = False, compile_model: bool = None):
     """Median wall time of ITERATIONS training steps, restarting from the same
     initial weights each repeat. The optimized model is compiled and warmed up
     once before timing, so compilation time is excluded (and reported in notes)."""
@@ -101,11 +107,13 @@ def time_training(optimized: bool, repeats: int = 5):
     base = build_model()
     init = copy.deepcopy(base.state_dict())
     model, note = base, ""
-    if optimized:
+    if compile_model is None:
+        compile_model = optimized
+    if compile_model:
         try:
             t = time.perf_counter()
             model = torch.compile(base)
-            train(model, x, y, 3, optimized=True)          # triggers compilation
+            train(model, x, y, 3, optimized=True, fused_adam=fused_adam)  # triggers compilation
             note = f"train compile time {time.perf_counter() - t:.1f}s (excluded)"
         except Exception as e:                             # e.g. no C++ compiler
             model, note = base, f"torch.compile unavailable for training: {type(e).__name__}"
@@ -115,7 +123,7 @@ def time_training(optimized: bool, repeats: int = 5):
         gc.collect()
         sync()
         t = time.perf_counter()
-        losses = train(model, x, y, ITERATIONS, optimized)
+        losses = train(model, x, y, ITERATIONS, optimized, fused_adam)
         sync()
         times.append(time.perf_counter() - t)
     last = losses[-1]
@@ -155,7 +163,8 @@ def main():
 
     # ---------------- training ----------------
     base_t, base_loss, _ = time_training(optimized=False)
-    opt_t, opt_loss, train_note = time_training(optimized=True)
+    fadam_t, _, _ = time_training(optimized=False, fused_adam=True)
+    opt_t, opt_loss, train_note = time_training(optimized=True, fused_adam=True)
 
     # ---------------- inference ----------------
     model = build_model().eval()
@@ -171,6 +180,17 @@ def main():
         inf_compiled = time_inference(compiled, x, "inference_mode")
     except Exception as e:                         # e.g. no C++ compiler available
         compile_note = f"torch.compile unavailable here: {type(e).__name__}"
+    inf_graphs = None
+    if DEVICE == "cuda" and not compile_note:
+        try:
+            graphed = torch.compile(model, mode="reduce-overhead")
+            with torch.inference_mode():
+                for _ in range(3):                 # record the CUDA graph
+                    got = graphed(x)
+                assert torch.allclose(model(x), got, atol=1e-5), "CUDA graph output differs"
+            inf_graphs = time_inference(graphed, x, "inference_mode")
+        except Exception as e:
+            compile_note += f" reduce-overhead failed: {type(e).__name__}: {e}"[:200]
 
     # ---------------- profiler traces ----------------
     xs, ys = sample_data()
@@ -178,8 +198,12 @@ def main():
     prof.export_chrome_trace("eeg_train_baseline_trace.json")
     print("\nTop ops, 50 baseline training iterations (torch.profiler):")
     print(table)
+    if DEVICE == "cuda":
+        _, table2 = top_ops(lambda: train(build_model(), xs, ys, 50, optimized=False, fused_adam=True))
+        print("\nTop ops, 50 iterations with Adam(fused=True):")
+        print(table2)
 
-    best_inf = min(v for v in (inf_mode, inf_compiled) if v is not None)
+    best_inf = min(v for v in (inf_mode, inf_compiled, inf_graphs) if v is not None)
     summary = {
         "device": DEVICE,
         "torch": torch.__version__,
@@ -187,12 +211,15 @@ def main():
         "train_baseline_s": round(base_t, 4),
         "train_optimized_s": round(opt_t, 4),
         "train_speedup": round(base_t / opt_t, 2),
+        "train_fused_adam_only_s": round(fadam_t, 4),
+        "train_fused_adam_speedup": round(base_t / fadam_t, 2),
         "final_loss_baseline": round(base_loss, 6),
         "final_loss_optimized": round(opt_loss, 6),
         "inference_batch": 256,
         "inference_baseline_us": round(inf_base, 1),
         "inference_mode_us": round(inf_mode, 1),
         "inference_compiled_us": None if inf_compiled is None else round(inf_compiled, 1),
+        "inference_cudagraphs_us": None if inf_graphs is None else round(inf_graphs, 1),
         "inference_speedup_best": round(inf_base / best_inf, 2),
         "notes": [n for n in (train_note, compile_note) if n],
     }
